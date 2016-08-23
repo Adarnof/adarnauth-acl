@@ -12,6 +12,7 @@ setup(
     install_requires=[
         'requests>=2.9.1',
         'django>=1.9.1',
+        'django-extras',
         'adarnauth-eveonline',
     ],
     packages=find_packages(),

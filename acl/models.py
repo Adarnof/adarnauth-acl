@@ -1,16 +1,138 @@
 from __future__ import unicode_literals
+from functools import total_ordering
 from django.db import models
 from django.utils.encoding import python_2_unicode_compatible
-from eveonline.models import BaseEntity, Character, Corporation, Alliance
+from django.contrib.auth import get_user_model
+from eveonline.models import BaseEntity
+from acl.app_settings import ACL_USER_CHECK_ID_FIELD
+
+# Naming constants
 
 ADMIN = 'Admin'
 MANAGER = 'Manager'
 MEMBER = 'Member'
 BLOCKED = 'Blocked'
-NONE = None
+NONE = 'None'
 CHARACTER_LEVEL = 'Character'
-CORP_LEVEL = 'Corporation'
+CORP_LEVEL = 'Corp'
 ALLIANCE_LEVEL = 'Alliance'
+FACTION_LEVEL = 'Faction'
+PUBLIC_LEVEL = 'Public'
+
+# Helper classes for sorting responses
+
+@python_2_unicode_compatible
+@total_ordering
+class AclLevel(object):
+    LEVEL_MAP = {
+        CHARACTER_LEVEL: 5,
+        CORP_LEVEL: 4,
+        ALLIANCE_LEVEL: 3,
+        FACTION_LEVEL: 2,
+        PUBLIC_LEVEL: 1,
+        NONE: 0,
+    }
+
+    def __init__(self, level):
+        self.level = level
+
+    def __int__(self):
+        return self.LEVEL_MAP[self.level]
+
+    def __str__(self):
+        return self.level
+
+    def __eq__(self, other):
+        return int(self) == int(other)
+
+    def __lt__(self, other):
+        return int(self) < int(other)
+
+    def __bool__(self):
+        return bool(self.__int__())
+
+    def __nonzero__(self):
+        return self.__bool__()
+
+@python_2_unicode_compatible
+@total_ordering
+class AclRole(object):
+    ROLE_MAP = {
+        BLOCKED: 4,
+        ADMIN: 3,
+        MANAGER: 2,
+        MEMBER: 1,
+        NONE: 0,
+    }
+
+    def __init__(self, role):
+        self.role = role
+
+    def __str__(self):
+        return self.role
+
+    def __int__(self):
+        return self.ROLE_MAP[self.role]
+
+    def __bool__(self):
+        return bool(self.__int__()) and self.__int__() != self.ROLE_MAP[BLOCKED]
+
+    def __nonzero__(self):
+        return self.__bool__()
+
+    def __eq__(self, other):
+        return int(self) == int(other)
+
+    def __lt__(self, other):
+        return int(self) < int(other)
+
+# Define ACL Levels
+character_level = AclLevel(CHARACTER_LEVEL)
+corp_level = AclLevel(CORP_LEVEL)
+alliance_level = AclLevel(ALLIANCE_LEVEL)
+faction_level = AclLevel(FACTION_LEVEL)
+public_level = AclLevel(PUBLIC_LEVEL)
+none_level = AclLevel(NONE)
+
+# Define ACL Roles
+blocked_role = AclRole(BLOCKED)
+admin_role = AclRole(ADMIN)
+manager_role = AclRole(MANAGER)
+member_role = AclRole(MEMBER)
+none_role = AclRole(NONE)
+
+@python_2_unicode_compatible
+@total_ordering
+class AclResponse(object):
+    """
+    Convenience class for returning :model:'acl.AccessList' membership status.
+    """
+
+    def __init__(self, level, role):
+        self.level = level
+        self.role = role
+
+    def __bool__(self):
+        return bool(self.role)
+
+    def __nonzero__(self):
+        return self.__bool__()
+
+    def __str__(self):
+        return "%s %s" % (self.level, self.role)
+
+    def __eq__(self, other):
+        return (self.level, self.role) == (other.level, other.role)
+
+    def __lt__(self, other):
+        if int(other) and not int(self):
+            # none always lower regardless of level
+            return True
+        else:
+            return (self.level, self.role) < (other.level, other.role)
+            
+# Define default response
+empty_response = AclResponse(none_level, none_role)
 
 @python_2_unicode_compatible
 class Entity(BaseEntity):
@@ -21,6 +143,7 @@ class Entity(BaseEntity):
         ('Character', 'Character'),
         ('Corporation', 'Corporation'),
         ('Alliance', 'Alliance'),
+        ('Faction', 'Faction'),
     )
     type = models.CharField(max_length=11, choices=TYPE_CHOICES)
 
@@ -32,10 +155,10 @@ class AccessList(models.Model):
     """
     A Django representation of an in-game Access List
     """
-    name = models.CharField(max_length=30)
-    description = models.CharField(max_length=200)
+    name = models.CharField(max_length=30) # yes I counted
+    description = models.CharField(max_length=200) # I counted this too
 
-    entities = models.ManyToManyField(Entity, through=AccessListMembership)
+    entities = models.ManyToManyField(Entity, through='acl.AccessListMembership')
     public = models.BooleanField(default=False, help_text="Allow public access.")
 
     def __str__(self):
@@ -47,87 +170,43 @@ class AccessList(models.Model):
         """
         try:
             membership = self.membership_set.get(entity__id=entity.id)
-            return membership.role
+            return AclRole(membership.role)
         except AccessListMembership.DoesNotExist:
-            return NONE
+            return none_role
 
-    def check_alliance_role(self, alliance):
+    def check_membership(self, entity):
         """
-        Checks the role of a :model:'eveonline.Alliance'
+        Determines role of a given entity, taking into account role definitions
+        for parent affiliations.
+        Assumes entity's direct role is character level to prioritize it.
         """
-        return self.check_entity_role(alliance)
-
-    def check_corporation_role(self, corp):
-        """
-        Checks the role of a :model:'eveonline.Corporation'
-        """
-        role = self.check_entity_role(corp)
-        if role != NONE:
-            return role
+        User = get_user_model()
+        roles = [none_response]
+        if isinstance(entity, User) or issubclass(entity, User):
+            parial_entity = BaseEntity(id=getattr(entity, ACL_USER_CHECK_ID_FIELD))
+            roles.append(AclResponse(character_level, role=self.check_entity_role(partial_entity)))
         else:
-            if corp.alliance_id:
-                return self.check_alliance_role(Alliance(id=corp.alliance_id))
-            return None
-
-    def check_character_role(self, char):
-        """
-        Checks the role of a :model:'eveonline.Character'
-        """
-        role = self.check_entity_role(char)
-        if role != NONE:
-            return role
-        else:
-            return self.check_corporation_role(Corp(id=char.corporation_id, alliance_id=char.alliance_id))
-
-    def check_role(self, entity):
-        """
-        A method for determining the role of a given entity in
-        the access list.
-        """
-        if isinstance(entity, Character):
-            return self.check_character_role(entity)
-        elif isinstance(entity, Corporation):
-            return self.check_corporation_role(entity)
-        elif isinstance(entity, Alliance):
-            return self.check_alliance_role(entity)
-        elif isinstance(entity, BaseEntity):
-            return self.check_entity_role(entity)
-        else:
-            raise ValueError("Unrecognized entity class.")
-
-    def check_role_level(self, entity):
-        """
-        A method for determining the role of a given entity and
-        the level at which this role is granted.
-        """
-        if isinstance(entity, Character):
-            role = self.check_entity_role(entity)
-            if role != NONE:
-                return role, CHARACTER_LEVEL
-            role = self.check_entity_role(Corporation(id=entity.corporation_id))
-            if role != NONE:
-                return role, CORP_LEVEL
-            if entity.alliance_id:
-                role = self.check_entity_role(Alliance(id=entity.alliance_id))
-                if role != NONE:
-                    return role, ALLIANCE_LEVEL
-            return NONE, None
-        elif isinstance(entity, Corporation):
-            role = self.check_entity_role(entity)
-            if role != NONE:
-                return role, CORP_LEVEL
-            if entity.alliance_id:
-                role = self.check_entity_level(Alliance(id=entity.alliance_id))
-                if role != NONE:
-                    return role, ALLIANCE_LEVEL
-            return NONE, None
-         elif isinstance(entity, Alliance):
-             role = self.check_entity_level(entity)
-             if role != NONE:
-                 return role, ALLIANCE_LEVEL
-             return NONE, None
-         else:
-             raise ValueError("Unrecognized entity class.")
+            roles.append(AclResponse(character_level, role=self.check_entity_role(entity)))
+        if hasattr(entity, 'character_id') and entity.character_id:
+            partial_entity = BaseEntity(id=entity.character_id)
+            entity_role = self.check_entity_role(partial_entity)
+            roles.append(AclResponse(character_level, entity_role))
+        if hasattr(entity, 'corporation_id') and entity.corporation_id:
+            partial_entity = BaseEntity(id=entity.corporation_id)
+            entity_role = self.check_entity_role(partial_entity)
+            roles.append(AclResponse(corporation_level, entity_role))
+        if hasattr(entity, 'alliance_id') and entity.alliance_id:
+            partial_entity = BaseEntity(id=entity.alliance_id)
+            entity_role = self.check_entity_role(partial_entity)
+            roles.append(AclResponse(alliance_level, entity_role))
+        if hasattr(entity, 'faction_id') and entity.faction_id:
+            partial_entity = BaseEntity(id=entity.faction_id)
+            entity_role = self.check_entity_role(partial_entity)
+            roles.append(AclResponse(faction_level, entity_role))
+        if self.public:
+            # public access defaults to member
+            roles.append(AclResponse(public_level, member_role))
+        return roles.sort(reverse=True)[0]
 
 @python_2_unicode_compatible
 class AccessListMembership(models.Model):
@@ -142,65 +221,32 @@ class AccessListMembership(models.Model):
     )
 
     entity = models.ForeignKey(Entity, related_name='membership_set', help_text="The EVE Entity to which this membership applies.")
-    access_list = models.ForeignKey('AccessList', related_name='membership_set', help_text="The Access List to which this Entity belongs.")
+    access_list = models.ForeignKey(AccessList, related_name='membership_set', help_text="The Access List to which this Entity belongs.")
     role = models.CharField(max_length=7, choices=ROLE_CHOICES, default=MEMBER, help_text="The role of this Entity in the Access List.")
 
     class Meta:
         unique_together = (('entity', 'access_list'),)
 
     def __str__(self):
-        return "%s %s of %s" % (self.role, self.entity, self.access_list))
+        return "%s %s of %s" % (self.role, self.entity, self.access_list)
 
 @python_2_unicode_compatible
-class Profile(models.Model):
+class AclProfileMixin(models.Model):
     """
     Basic profile structure for allowing access.
     """
-    name = models.CharField(max_length=30)
+
     can_access = models.ManyToManyField(AccessList)
 
-    def __str__(self):
-        return self.name
-
-    def collect_roles(self, entity):
-        """
-        Collects a list of all roles and their assigned levels for
-        a given entity.
-        """
-        roles = []
-        for list in self.can_access.all():
-            access = list.check_role_level(entity):
-            roles.append({access.0: access.1})
-        return roles
+    class Meta:
+        abstract = True
 
     def check_access(self, entity):
         """
         Determines the overall access of a given entity.
         Character access overrides corp access which overrides alliance access.
         """
-        roles = self.collect_roles(entity)
-        role_dict = {
-            CHARACTER_LEVEL:[],
-            CORP_LEVEL:[],
-            ALLIANCE_LEVEL:[],
-            None:[],
-        }
-        for r in roles:
-            role_dict[r.1].append(r.0)
-        access = None
-        if role_dict[CHARACTER_LEVEL]:
-            if BLOCKED in role_dict[CHARACTER_LEVEL]:
-                access = False
-            elif (MEMBER or MANAGER or ADMIN) in role_dict[CHARACTER_LEVEL]:
-                access = True
-        if access == None and role_dict[CORP_LEVEL]:
-            if BLOCKED in role_dict[CORP_LEVEL]:
-                access = False
-            elif (MEMBER or MANAGER or ADMIN) in role_dict[CORP_LEVEL]:
-                access = True
-        if access == None and role_dict[ALLIANCE_LEVEL]:
-            if BLOCKED in role_dict[ALLIANCE_LEVEL]:
-                access = False
-            elif (MEMBER or MANAGER or ADMIN) in role_dict[ALLIANCE_LEVEL]:
-                accesss = True
-        return access
+        access_list = [x.check_membership(entity) for x in self.can_access.all()]
+        access_list.append(empty_response)
+        access_list.sort(reverse=True)
+        return bool(access_list[0])
