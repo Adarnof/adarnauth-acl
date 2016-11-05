@@ -14,6 +14,7 @@ setup(
         'django>=1.9.1',
         'django-extras',
         'adarnauth-eveonline',
+        'adarnauth-eve-sso>=1.1',
     ],
     packages=find_packages(),
     include_package_data=True,

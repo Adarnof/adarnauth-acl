@@ -3,8 +3,10 @@ from functools import total_ordering
 from django.db import models
 from django.utils.encoding import python_2_unicode_compatible
 from django.contrib.auth import get_user_model
-from eveonline.models import BaseEntity
-from acl.app_settings import ACL_USER_CHECK_ID_FIELD
+from eveonline.models import BaseEntity, EVECharacter
+from eve_sso.models import AccessToken
+from django.conf import settings
+from djang.contrib.auth import get_user_model
 
 # Naming constants
 
@@ -20,6 +22,17 @@ FACTION_LEVEL = 'Faction'
 PUBLIC_LEVEL = 'Public'
 
 # Helper classes for sorting responses
+
+ROLE_CHOICES = (
+    (ADMIN, ADMIN),
+    (MANAGER, MANAGER),
+    (MEMBER, MEMBER),
+    (BLOCKED, BLOCKED),
+)
+RESTRICTED_ROLE_CHOICES = (
+    (MEMBER, MEMBER),
+    (BLOCKED, BLOCKED),
+)
 
 @python_2_unicode_compatible
 @total_ordering
@@ -111,7 +124,6 @@ class AclResponse(object):
     def __init__(self, level, role):
         self.level = level
         self.role = role
-
     def __bool__(self):
         return bool(self.role)
 
@@ -134,6 +146,7 @@ class AclResponse(object):
 # Define default response
 empty_response = AclResponse(none_level, none_role)
 
+
 @python_2_unicode_compatible
 class Entity(BaseEntity):
     """
@@ -149,6 +162,7 @@ class Entity(BaseEntity):
 
     def __str__(self):
         return "%s %s" % (self.type, self.name)
+
 
 @python_2_unicode_compatible
 class AccessList(models.Model):
@@ -180,13 +194,8 @@ class AccessList(models.Model):
         for parent affiliations.
         Assumes entity's direct role is character level to prioritize it.
         """
-        User = get_user_model()
         roles = [none_response]
-        if isinstance(entity, User) or issubclass(entity, User):
-            parial_entity = BaseEntity(id=getattr(entity, ACL_USER_CHECK_ID_FIELD))
-            roles.append(AclResponse(character_level, role=self.check_entity_role(partial_entity)))
-        else:
-            roles.append(AclResponse(character_level, role=self.check_entity_role(entity)))
+        roles.append(AclResponse(character_level, role=self.check_entity_role(entity)))
         if hasattr(entity, 'character_id') and entity.character_id:
             partial_entity = BaseEntity(id=entity.character_id)
             entity_role = self.check_entity_role(partial_entity)
@@ -208,20 +217,34 @@ class AccessList(models.Model):
             roles.append(AclResponse(public_level, member_role))
         return roles.sort(reverse=True)[0]
 
+    def _user_qs_by_role(self, role):
+        User = get_user_model()
+        return User.objects.filter(accesstoken_set__usercharacterownership_set__acl_memberships__access_list=self, accesstoken_set__usercharacterownership_set__acl_memberships__role=role)
+
+    @property
+    def members(self):
+        return self._user_qs_by_role(MEMBER)
+
+    @property
+    def managers(self):
+        return self._user_qs_by_role(MANAGER)
+
+    @property
+    def admins(self):
+        return self._user_qs_by_role(ADMIN)
+
+    @property
+    def blocked(self):
+        return self._user_qs_by_role(BLOCKED)
+
+
 @python_2_unicode_compatible
 class AccessListMembership(models.Model):
     """
     Intermediate model to record Entity-AccessList relationships.
     """
-    ROLE_CHOICES = (
-        (ADMIN, ADMIN),
-        (MANAGER, MANAGER),
-        (MEMBER, MEMBER),
-        (BLOCKED, BLOCKED),
-    )
-
-    entity = models.ForeignKey(Entity, related_name='membership_set', help_text="The EVE Entity to which this membership applies.")
-    access_list = models.ForeignKey(AccessList, related_name='membership_set', help_text="The Access List to which this Entity belongs.")
+    entity = models.ForeignKey(Entity, related_name='memberships', help_text="The EVE Entity to which this membership applies.")
+    access_list = models.ForeignKey(AccessList, related_name='memberships', help_text="The Access List to which this Entity belongs.")
     role = models.CharField(max_length=7, choices=ROLE_CHOICES, default=MEMBER, help_text="The role of this Entity in the Access List.")
 
     class Meta:
@@ -229,6 +252,7 @@ class AccessListMembership(models.Model):
 
     def __str__(self):
         return "%s %s of %s" % (self.role, self.entity, self.access_list)
+
 
 @python_2_unicode_compatible
 class AclProfileMixin(models.Model):
@@ -241,12 +265,37 @@ class AclProfileMixin(models.Model):
     class Meta:
         abstract = True
 
-    def check_access(self, entity):
+    def check_access(self, user):
         """
         Determines the overall access of a given entity.
         Character access overrides corp access which overrides alliance access.
         """
-        access_list = [x.check_membership(entity) for x in self.can_access.all()]
-        access_list.append(empty_response)
+        access_list = [empty_response]
+        for char in user.owned_characters.all():
+            access_list.extend([x.check_membership(char) for x in self.can_access.all()])
         access_list.sort(reverse=True)
         return bool(access_list[0])
+
+
+@python_2_unicode_compatible
+class UserCharacterOwnership(models.Model):
+    """
+    User character ownership via CREST token
+    """
+    character = models.ForeignKey(EVECharacter, on_delete=models.CASCADE, related_name='owning_users')
+    token = models.ForeignKey(AccessToken, on_delete=models.CASCADE)
+
+    def __str__(self):
+        return '%s owned by %s' % (str(self.character), str(self.token.user))
+
+
+@python_2_unicode_compatible
+class UserAclMembership(models.Model):
+    """
+    Record of ACL membership based on owned character
+    """
+    ownership = models.ForeignKey(UserCharacterOwnership, related_name='acl_memberships', help_text="The owned character which is a member of the Access List")
+    membership = models.ForeignKey(AccessListMembership, related_name='user_memberships', help_text="The Access List Member to which this Entity belongs.")
+
+    def __str__(self):
+        return " applied to " % (self.membership, self.ownership)

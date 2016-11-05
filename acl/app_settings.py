@@ -1,3 +1,3 @@
 from django.conf import settings
 
-ACL_USER_CHECK_ID_FIELD = getattr(settings, 'ACL_USER_CHECK_ID_FIELD',  'pk')
+ACL_USER_CHARACTER_ID_FIELD = getattr(settings, 'ACL_USER_CHARACTER_ID_FIELD',  'pk')
